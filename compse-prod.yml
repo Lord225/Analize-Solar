@@ -1,0 +1,6 @@
+services:
+  solar-prediction:
+      build:
+        context: .
+        dockerfile: server/Dockerfile
+      
