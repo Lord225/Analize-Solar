@@ -1,0 +1,14 @@
+services:
+  solar-prediction:
+      build:
+        context: .
+        dockerfile: Dockerfile
+      environment:
+        TZ: Europe/Warsaw
+        SOLAR_API_URL: http://host.docker.internal:5555
+      ports:
+        - "5554:5554"
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
+      container_name: solar-prediction
+      restart: always

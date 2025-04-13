@@ -1,5 +1,6 @@
-from math import e
 from typing import Tuple
+from cachetools import TTLCache, cached
+from cachetools.keys import hashkey 
 import flask
 import os
 import urllib3
@@ -7,10 +8,12 @@ import json
 import datetime
 import pandas as pd
 import numpy as np
+import logging
 
 API_URL = os.getenv('SOLAR_API_URL', 'http://raspberrypi.local:5555')
 http = urllib3.PoolManager()
 
+logger = logging.getLogger('solar-predictor')
 
 def fetch_solar_data(dt: datetime.datetime) -> pd.DataFrame:
     dt = datetime.datetime(dt.year, dt.month, dt.day, 0, 0, 0)
@@ -85,19 +88,20 @@ def load_dataset(dt: datetime.datetime, current_overload=None) -> Tuple[np.ndarr
     try:
         solar = fetch_solar_data(dt)
     except Exception as e:
-        print(f"Error fetching solar data: {e}")
+        logger.error(f"Error fetching solar data: {e}")
         return None
     
     try:
         weather = fetch_weather_data(dt)
     except Exception as e:
-        print(f"Error fetching weather data: {e}")
+        logger.error(f"Error fetching weather data: {e}")
         return None
     
     dataset, date_range_df, current = preprocess_dataset(solar, weather)
 
     if current_overload is not None:
-        current = current_overload
+        current = int(current_overload)
+        
 
     d,m,i = prep_sample(dataset, current)
 
@@ -143,7 +147,7 @@ def load_model(path) -> AutoRegressiveTransformer:
         dropout=0.1,
         seq_len=169,
     )
-    model.load_state_dict(th.load(path, weights_only=True))
+    model.load_state_dict(th.load(path, weights_only=True, map_location=th.device('cpu')))
     return model
 
 
@@ -154,6 +158,8 @@ def load_model(path) -> AutoRegressiveTransformer:
 model_normal = load_model(os.getenv('MODEL_NORMAL_PATH', 'final-full.pth'))
 model_optimistic = load_model(os.getenv('MODEL_OPTIMISTIC_PATH', 'final-filtred.pth'))
 model_pessimistic = load_model(os.getenv('MODEL_PESSIMISTIC_PATH', 'final-filtred-pesimistic.pth'))
+
+logger.info("Models loaded")
 
 def auto_regression(model, dataset: Tuple[np.ndarray, np.ndarray, int]):
     data, mask, mask_idx = dataset
@@ -206,16 +212,48 @@ def get_acc(mask_idx):
     
     return "optimal"
 
-import matplotlib.pyplot as plt
-
-prev_prediction = dict()
-prev_prediction_hash = hash(0)
-
-def make_prediction(dt: datetime.datetime, prediction_start = None) -> dict:
-    global prev_prediction, prev_prediction_hash
-    
+@cached(cache=TTLCache(maxsize=32, ttl=300), key=lambda _, dt, dataset, simple: hashkey((dt.year, dt.month, dt.day, simple)))
+def run_autoregression_cached(model, dt, dataset: Tuple[np.ndarray, np.ndarray, int, pd.DataFrame], simple=False) -> dict:
     start_time = datetime.datetime.now()
+    
+    data, mask, mask_idx, time_range = dataset
 
+    logger.info(f"Prediction for {dt} with mask_idx {mask_idx} in {'simple' if simple else 'full'} mode")
+
+    data_normal = auto_regression(model_normal, (data, mask, mask_idx))
+    data_optimistic = auto_regression(model_optimistic, (data, mask, mask_idx)) if model_optimistic is not None else None
+    data_pessimistic = auto_regression(model_pessimistic, (data, mask, mask_idx)) if model_pessimistic is not None else None
+
+    energy_normal = calc_total_energy(data_normal)
+    energy_optimistic = calc_total_energy(data_optimistic) if data_optimistic is not None else None
+    energy_pessimistic = calc_total_energy(data_pessimistic) if data_pessimistic is not None else None
+
+    df = to_dataframe(
+        dates=time_range.index,
+        normal_pred=data_normal,
+        optimistic_pred=data_optimistic if data_optimistic is not None else None,
+        pessimistic_pred=data_pessimistic if data_pessimistic is not None else None,
+    )
+
+    end_time = datetime.datetime.now()
+
+    return {
+        "status": "success",
+        "data": df.to_dict(orient='records'),
+        "energy": {
+            "normal": energy_normal,
+            "optimistic": energy_optimistic,
+            "pessimistic": energy_pessimistic,
+        },
+        "prediction_start": time_range.index[mask_idx].strftime('%Y-%m-%d %H:%M:%S'),
+        "prediction_end": time_range.index[-1].strftime('%Y-%m-%d %H:%M:%S'),
+        "prediction_accuracy": get_acc(mask_idx),
+        "prediction_index": mask_idx,
+        "prediction_time": (end_time - start_time).total_seconds(),
+        "mode": "simple" if simple else "full",
+    }
+
+def make_prediction(dt: datetime.datetime, prediction_start=None, simple=False) -> dict:
     dataset = load_dataset(dt, current_overload=prediction_start)
 
     if dataset is None:
@@ -224,57 +262,8 @@ def make_prediction(dt: datetime.datetime, prediction_start = None) -> dict:
             'message': 'Failed to load dataset'
         }
     
-    data, mask, mask_idx, time_range = dataset
+    return run_autoregression_cached(model_normal, dt, dataset, simple=simple)
 
-    hashed = hash(
-        (dt.year, dt.month, dt.day, mask_idx),
-    )
-
-    if prev_prediction_hash != hashed:
-        data_normal = auto_regression(model_normal, (data, mask, mask_idx))
-        data_optimistic = auto_regression(model_optimistic, (data, mask, mask_idx))
-        data_pessimistic = auto_regression(model_pessimistic, (data, mask, mask_idx))
-        prev_prediction_hash = hashed
-        prev_prediction['normal'] = data_normal
-        prev_prediction['optimistic'] = data_optimistic
-        prev_prediction['pessimistic'] = data_pessimistic
-        from_cache = False
-    else:
-        data_normal = prev_prediction['normal']
-        data_optimistic = prev_prediction['optimistic']
-        data_pessimistic = prev_prediction['pessimistic']
-        from_cache = True
-
-    energy_normal = calc_total_energy(data_normal)
-    energy_optimistic = calc_total_energy(data_optimistic)
-    energy_pessimistic = calc_total_energy(data_pessimistic)
-    
-    df = to_dataframe(
-        dates=time_range.index,
-        normal_pred=data_normal,
-        optimistic_pred=data_optimistic,
-        pessimistic_pred=data_pessimistic,
-    )
-
-    end_time = datetime.datetime.now()
-    
-    return {
-        "status": "success",
-        "data": df.to_dict(orient='records'),
-        "energy": {
-            "normal": float(energy_normal),
-            "optimistic": float(energy_optimistic),
-            "pessimistic": float(energy_pessimistic),
-        },
-        "prediction_start": time_range.index[mask_idx].strftime('%Y-%m-%d %H:%M:%S'),
-        "prediction_end": time_range.index[-1].strftime('%Y-%m-%d %H:%M:%S'),
-        "prediction_accuracy": get_acc(mask_idx),
-        "prediction_index": mask_idx,
-        "prediction_time": (end_time - start_time).total_seconds(),
-        "cached": from_cache,
-        "hash": hashed,
-    }
-    
 app = flask.Flask(__name__)
 
 @app.route('/solar/predict', methods=['GET'])
@@ -282,8 +271,10 @@ def predict():
     dt = flask.request.args.get('datetime', default=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     dt = datetime.datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
 
-    prediction_start = flask.request.args.get('prediction_start', default=None, type=int)
-    result = make_prediction(dt, prediction_start=prediction_start)
+    prediction_start = flask.request.args.get('prediction_start', default=None, type=str)
+    simple = flask.request.args.get('simple', default=False, type=bool)
+
+    result = make_prediction(dt, prediction_start=prediction_start, simple=simple)
     return  json.dumps(result, default=str)
 
 

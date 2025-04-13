@@ -16,8 +16,8 @@ COPY solar-prediction.py .
 COPY models/ ./models
 # set env (MODEL_NORMAL_PATH)
 ENV MODEL_NORMAL_PATH=/app/models/final-full.pth
-ENV MODEL_OPTIMISTIC_PATH=/app/models/final-filtred-optimistic.pth
-ENV MODEL_PESSIMISTIC_PATH=/app/models/final-filtred-pessimistic.pth
+ENV MODEL_OPTIMISTIC_PATH=/app/models/final-filtred.pth
+ENV MODEL_PESSIMISTIC_PATH=/app/models/final-filtred-pesimistic.pth
 
 # Run the application
 CMD ["python", "solar-prediction.py"]

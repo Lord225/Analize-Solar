@@ -3,4 +3,5 @@ Flask==3.0.3
 pandas
 numpy
 urllib3==1.26.18
-torch=2.5.0
+torch==2.5.1
+cachetools==5.5.2
